@@ -1,0 +1,27 @@
+[Unit]
+Description=Policy WebSocket Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/policy_deployment
+Environment=PYTHONPATH=/opt/policy_deployment
+EnvironmentFile=/etc/policy_deployment/env  # POLICY_SERVER_API_KEYS=...
+ExecStart=/opt/policy_deployment/.venv/bin/python scripts/launch.py \
+    --policy examples.my_policy:MyPolicy \
+    --policy-kwargs checkpoint_path=/data/ckpt.pt \
+    --host 127.0.0.1 --port 8000 \
+    --max-connections 8
+
+Restart=on-failure
+RestartSec=3
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/policy_server
+
+[Install]
+WantedBy=multi-user.target
