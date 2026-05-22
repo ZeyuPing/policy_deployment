@@ -84,8 +84,8 @@ then:
 mjpython sim/check_in_sim.py --mode policy \
     --bundle sim/assets/example_slim.pkl \
     --host 127.0.0.1 --port 8000 \
-    --prompt "fold the cloth" \
-    --action-horizon 10
+    --prompt "Insert the battery to the mouse." \
+    --action-horizon 50
 ```
 
 At each step the script builds an obs as documented in the top-level
@@ -98,7 +98,8 @@ README (`images` dict of CHW uint8 arrays, `state` 14-dim float, optional
 mjpython sim/check_in_sim.py --mode compare \
     --bundle sim/assets/example_slim.pkl \
     --host 127.0.0.1 --port 8000 \
-    --prompt "fold the cloth"
+    --prompt "Insert the battery to the mouse." \
+    --action-horizon 50
 ```
 
 For each sample in the slim bundle the script will:

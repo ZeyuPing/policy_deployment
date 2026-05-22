@@ -65,7 +65,7 @@ if str(_REPO_ROOT) not in sys.path:
 import mujoco
 import mujoco.viewer
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 from scripts._client import WebsocketPolicyClient
 
@@ -476,6 +476,222 @@ def run_compare_slim(model, data, viewer, qpos_addrs, ctrl_idxs, bundle, *,
 
 
 # ---------------------------------------------------------------------------
+# Mode: compare → side-by-side mp4
+# Two independent sims, REPLAY on the left, POLICY on the right, with the
+# current sample/frame labelled at the top. Shorter side freezes on its last
+# rendered frame until the longer side finishes.
+# ---------------------------------------------------------------------------
+
+def _load_overlay_font(size: int) -> ImageFont.ImageFont:
+    for name in ("Arial.ttf", "Helvetica.ttc", "DejaVuSans.ttf", "Arial Unicode.ttf"):
+        try:
+            return ImageFont.truetype(name, size=size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def _draw_text(draw: ImageDraw.ImageDraw, text: str, xy: tuple[int, int],
+               font: ImageFont.ImageFont) -> None:
+    x, y = xy
+    for dx in (-2, -1, 0, 1, 2):
+        for dy in (-2, -1, 0, 1, 2):
+            if dx or dy:
+                draw.text((x + dx, y + dy), text, font=font, fill=(0, 0, 0))
+    draw.text((x, y), text, font=font, fill=(255, 255, 255))
+
+
+def _text_width(draw: ImageDraw.ImageDraw, text: str,
+                font: ImageFont.ImageFont) -> int:
+    try:
+        l, _, r, _ = draw.textbbox((0, 0), text, font=font)
+        return r - l
+    except AttributeError:  # very old Pillow
+        return draw.textsize(text, font=font)[0]
+
+
+class _DualVideoSink:
+    """Side-by-side dual-sim mp4 writer for compare mode."""
+
+    def __init__(self, model_L: mujoco.MjModel, data_L: mujoco.MjData,
+                 model_R: mujoco.MjModel, data_R: mujoco.MjData, *,
+                 out_path: Path, camera: str,
+                 panel_width: int, panel_height: int, fps: int):
+        import imageio
+        self.data_L, self.data_R = data_L, data_R
+        self.camera = camera
+        self.fps = fps
+        self.dt_video = 1.0 / fps
+        self.next_t = 0.0
+        self.frames = 0
+        self.panel_width = panel_width
+        self.panel_height = panel_height
+        self.renderer_L = mujoco.Renderer(model_L, height=panel_height, width=panel_width)
+        self.renderer_R = mujoco.Renderer(model_R, height=panel_height, width=panel_width)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        self.writer = imageio.get_writer(
+            str(out_path), fps=fps, codec="libx264", quality=8,
+            macro_block_size=1,
+        )
+        self.label_top = ""  # e.g. "sample 3  frame 152"
+        self.font_big = _load_overlay_font(max(16, int(panel_height * 0.07)))
+        self.font_small = _load_overlay_font(max(14, int(panel_height * 0.05)))
+        self._closed = False
+        self.out_path = out_path
+
+    def render_L(self) -> np.ndarray:
+        self.renderer_L.update_scene(self.data_L, camera=self.camera)
+        return self.renderer_L.render()
+
+    def render_R(self) -> np.ndarray:
+        self.renderer_R.update_scene(self.data_R, camera=self.camera)
+        return self.renderer_R.render()
+
+    def _compose(self, frame_L: np.ndarray, frame_R: np.ndarray) -> np.ndarray:
+        composite = np.concatenate([frame_L, frame_R], axis=1)
+        img = Image.fromarray(composite)
+        draw = ImageDraw.Draw(img)
+        _draw_text(draw, "REPLAY", (12, 10), self.font_small)
+        _draw_text(draw, "POLICY", (self.panel_width + 12, 10), self.font_small)
+        if self.label_top:
+            tw = _text_width(draw, self.label_top, self.font_big)
+            x = self.panel_width - tw // 2  # composite center
+            _draw_text(draw, self.label_top, (x, 10), self.font_big)
+        return np.asarray(img)
+
+    def write_pair(self, frame_L: np.ndarray, frame_R: np.ndarray) -> None:
+        self.writer.append_data(self._compose(frame_L, frame_R))
+        self.frames += 1
+
+    def write_static(self, frame_L: np.ndarray, frame_R: np.ndarray,
+                     duration_s: float) -> None:
+        n = max(1, int(round(duration_s * self.fps)))
+        for _ in range(n):
+            self.write_pair(frame_L, frame_R)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.writer.close()
+        self.renderer_L.close()
+        self.renderer_R.close()
+        print(f"Wrote {self.out_path}  frames={self.frames}  fps={self.fps}")
+
+
+def run_compare_slim_dual_video(scene_path: Path, bundle: dict, *,
+                                 host: str, port: int, prompt: str,
+                                 api_key: str | None = None,
+                                 action_horizon: int | None = None,
+                                 out_path: Path,
+                                 camera: str,
+                                 panel_width: int, panel_height: int,
+                                 fps: int,
+                                 ctrl_hz: float = 60.0,
+                                 transition_s: float = 0.8) -> None:
+    client = WebsocketPolicyClient(host=host, port=port, api_key=api_key)
+    print(f"Connected to policy server at {host}:{port}")
+
+    model_L, data_L = build_model(scene_path)
+    model_R, data_R = build_model(scene_path)
+    qpos_L, ctrl_L = _resolve_indices(model_L)
+    qpos_R, ctrl_R = _resolve_indices(model_R)
+
+    samples = bundle["samples"]
+    sim_dt = model_L.opt.timestep
+    ctrl_dt = 1.0 / ctrl_hz
+    inner_steps = max(1, int(round(ctrl_dt / sim_dt)))
+    print(f"Compare (dual video): {len(samples)} samples  "
+          f"ctrl_hz={ctrl_hz:.1f}  sim_dt={sim_dt:.4f}s  "
+          f"inner_steps={inner_steps}  fps={fps}  "
+          f"panel={panel_width}x{panel_height}")
+
+    sink = _DualVideoSink(model_L, data_L, model_R, data_R,
+                          out_path=out_path, camera=camera,
+                          panel_width=panel_width, panel_height=panel_height,
+                          fps=fps)
+
+    with sink:
+        for s_idx, s in enumerate(samples):
+            recorded = np.asarray(s["action_chunk"])
+            H_rec = len(recorded) if action_horizon is None else min(action_horizon, len(recorded))
+            recorded = recorded[:H_rec]
+
+            # Reset both sims to the recorded state; reset sim clocks so
+            # each sample's video-rate gating starts at t=0.
+            _snap_to_state14(model_L, data_L, qpos_L, ctrl_L, s["state"])
+            _snap_to_state14(model_R, data_R, qpos_R, ctrl_R, s["state"])
+            data_L.time = 0.0
+            data_R.time = 0.0
+            sink.next_t = 0.0
+            sink.label_top = f"sample {s_idx}  frame {s['frame_idx']}"
+            print(f"\nsample[{s_idx:2d}] frame={s['frame_idx']:4d}")
+
+            # Title / transition card: hold the pre-roll pose with the label.
+            pre_L = sink.render_L()
+            pre_R = sink.render_R()
+            sink.write_static(pre_L, pre_R, transition_s)
+
+            # Query policy from the same starting state.
+            state_for_policy = np.ascontiguousarray(
+                np.asarray(s["state"], dtype=np.float64))
+            policy_input = {
+                "images": {
+                    "cam_high":        jpeg_to_chw(s["images"]["top_camera"]),
+                    "cam_left_wrist":  jpeg_to_chw(s["images"]["left_camera"]),
+                    "cam_right_wrist": jpeg_to_chw(s["images"]["right_camera"]),
+                },
+                "state":  state_for_policy,
+                "prompt": prompt,
+            }
+            chunk = np.asarray(client.infer(policy_input)["actions"])
+            H_pol = len(chunk) if action_horizon is None else min(action_horizon, len(chunk))
+            chunk = chunk[:H_pol]
+            print(f"  recorded={H_rec} actions  policy={H_pol} actions")
+
+            H_cmp = min(H_rec, H_pol)
+            if H_cmp > 0:
+                diff = chunk[:H_cmp] - recorded[:H_cmp]
+                l2 = float(np.linalg.norm(diff))
+                mx = float(np.max(np.abs(diff)))
+                print(f"  diff over {H_cmp} steps: L2={l2:.4f}  max|.|={mx:.4f}")
+
+            # Per-tick dual rollout. Each side only steps while it still has
+            # actions; once exhausted, its last rendered frame is reused so
+            # the shorter side freezes on screen.
+            H_max = max(H_rec, H_pol)
+            last_L = pre_L
+            last_R = pre_R
+            for t in range(H_max):
+                if t < H_rec:
+                    action14_to_ctrl(recorded[t], ctrl_L, data_L)
+                    for _ in range(inner_steps):
+                        mujoco.mj_step(model_L, data_L)
+                if t < H_pol:
+                    action14_to_ctrl(chunk[t], ctrl_R, data_R)
+                    for _ in range(inner_steps):
+                        mujoco.mj_step(model_R, data_R)
+                # Gate frame capture by sim time so fps stays independent of ctrl_hz.
+                if data_L.time + 1e-9 < sink.next_t:
+                    continue
+                if t < H_rec:
+                    last_L = sink.render_L()
+                if t < H_pol:
+                    last_R = sink.render_R()
+                sink.write_pair(last_L, last_R)
+                sink.next_t += sink.dt_video
+
+    print("\nCompare (dual video) run done.")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -501,7 +717,7 @@ def main() -> None:
     p.add_argument("--api-key", type=str, default=None,
                    help="API key for the policy server (omit for unauthenticated local runs)")
     p.add_argument("--prompt",  type=str, default="")
-    p.add_argument("--action-horizon", type=int, default=10,
+    p.add_argument("--action-horizon", type=int, default=50,
                    help="How many actions from each policy chunk to execute "
                         "before re-querying (default 10)")
     # output toggle: live viewer vs. offscreen video
@@ -526,6 +742,30 @@ def main() -> None:
     print(f"Loading bundle {args.bundle}")
     bundle = load_bundle(args.bundle)
     print(f"  T={bundle['meta']['n_frames']}  duration={bundle['meta']['duration_s']:.1f}s")
+
+    # Compare + video output takes the dedicated dual-sim, side-by-side path.
+    if args.mode == "compare" and args.output is not None:
+        if "samples" not in bundle:
+            raise SystemExit(
+                "--mode compare requires a slim bundle "
+                "(produced by scripts/make_slim_bundle.py)")
+        print(f"Compare video mode: writing side-by-side {args.output}  "
+              f"camera={args.render_camera} "
+              f"panel={args.render_width}x{args.render_height} @ {args.fps}fps")
+        run_compare_slim_dual_video(
+            args.scene, bundle,
+            host=args.host, port=args.port, prompt=args.prompt,
+            api_key=args.api_key,
+            action_horizon=None if args.action_horizon <= 0 else args.action_horizon,
+            out_path=args.output,
+            camera=args.render_camera,
+            panel_width=args.render_width,
+            panel_height=args.render_height,
+            fps=args.fps,
+            ctrl_hz=args.ctrl_hz,
+            transition_s=max(args.pause_s, 0.0) + 0.3,
+        )
+        return
 
     print(f"Loading scene {args.scene}")
     model, data = build_model(args.scene)
