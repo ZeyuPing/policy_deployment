@@ -29,7 +29,28 @@ scripts/
 deploy/
   nginx.conf.example     # TLS termination + reverse proxy
   policy-server.service  # systemd unit
+sim/
+  check_in_sim.py        # MuJoCo dual-YAM driver: replay / policy / compare modes
+  assets/                # scene XMLs + example slim bundle
+  README.md              # sim usage notes
 ```
+
+## Sim sandbox (`sim/`)
+
+A self-contained MuJoCo dual-YAM scene for sanity-checking a policy before
+hardware. `sim/check_in_sim.py` runs in three modes against a recorded
+bundle:
+
+- `--mode replay` — stream the recorded 14-dim action chunk into sim.
+- `--mode policy` — query a running policy server frame-by-frame and
+  execute the returned chunks.
+- `--mode compare` — for each sample in a slim bundle, run the recorded
+  chunk and the policy-predicted chunk from the same starting state. With
+  `--output xxx.mp4` they render side-by-side (left: REPLAY, right:
+  POLICY, labelled with the current sample/frame); in viewer mode they
+  play back-to-back in one window.
+
+See `sim/README.md` for the bundle format and end-to-end commands.
 
 ## Protocol
 
