@@ -20,7 +20,7 @@
       crank_4310 -> ../../gripper/crank_4310/assets/
   -->
 
-  <compiler angle="radian"/>
+  <compiler angle="radian" autolimits="true"/>
 
   <!-- ============================================================ -->
   <!-- Assets: shared meshes for both arms + gripper                -->
