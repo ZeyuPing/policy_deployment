@@ -171,6 +171,26 @@ def read_state14(qpos_addrs: np.ndarray, data: mujoco.MjData) -> np.ndarray:
 # Both expose .is_running() and .sync() so run_replay/run_policy don't care.
 # ---------------------------------------------------------------------------
 
+def _close_renderer(renderer) -> None:
+    """Best-effort cleanup across MuJoCo versions.
+
+    MuJoCo 2.3.x Renderer doesn't expose close(); newer versions do.
+    """
+    close = getattr(renderer, "close", None)
+    if callable(close):
+        close()
+        return
+
+    for attr in ("_mjr_context", "_gl_context"):
+        context = getattr(renderer, attr, None)
+        free = getattr(context, "free", None)
+        if callable(free):
+            try:
+                free()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 class _VideoSink:
     """Offscreen renderer + mp4 writer with the same minimal API as
     mujoco.viewer.Handle: .is_running() and .sync()."""
@@ -224,7 +244,7 @@ class _VideoSink:
             return
         self._closed = True
         self.writer.close()
-        self.renderer.close()
+        _close_renderer(self.renderer)
         print(f"Wrote {self.out_path}  frames={self.frames}  fps={self.fps}")
 
 
@@ -581,8 +601,8 @@ class _DualVideoSink:
             return
         self._closed = True
         self.writer.close()
-        self.renderer_L.close()
-        self.renderer_R.close()
+        _close_renderer(self.renderer_L)
+        _close_renderer(self.renderer_R)
         print(f"Wrote {self.out_path}  frames={self.frames}  fps={self.fps}")
 
 
